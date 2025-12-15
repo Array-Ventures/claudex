@@ -259,7 +259,8 @@ class ClaudeAgentService:
             env["ANTHROPIC_AUTH_TOKEN"] = user_settings.z_ai_api_key
             env["ANTHROPIC_BASE_URL"] = "https://api.z.ai/api/anthropic"
         elif (
-            provider == ModelProvider.ANTHROPIC and user_settings.claude_code_oauth_token
+            provider == ModelProvider.ANTHROPIC
+            and user_settings.claude_code_oauth_token
         ):
             env["CLAUDE_CODE_OAUTH_TOKEN"] = user_settings.claude_code_oauth_token
 
