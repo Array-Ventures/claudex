@@ -1,0 +1,379 @@
+import type { AssistantStreamEvent, ToolAggregate, ToolEventStatus } from '@/types';
+import type { LineReview } from '@/types/review.types';
+
+export interface TextSegment {
+  kind: 'text';
+  id: string;
+  text: string;
+}
+
+export interface ThinkingSegment {
+  kind: 'thinking';
+  id: string;
+  text: string;
+  eventIndex: number;
+}
+
+export interface ToolSegment {
+  kind: 'tool';
+  id: string;
+  tool: ToolAggregate;
+}
+
+export interface ReviewSegment {
+  kind: 'review';
+  id: string;
+  reviews: LineReview[];
+  eventIndex: number;
+}
+
+export type MessageSegment = TextSegment | ThinkingSegment | ToolSegment | ReviewSegment;
+
+const statusMap: Record<'tool_started' | 'tool_completed' | 'tool_failed', ToolEventStatus> = {
+  tool_started: 'started',
+  tool_completed: 'completed',
+  tool_failed: 'failed',
+};
+
+// Context object passed through tool processing functions to maintain state
+// - toolMap: Quick lookup of tools by ID for parent-child linking
+// - pendingChildren: Queue for child tools that arrive before their parent (out-of-order events)
+// - segmentIndexByToolId: Maps tool IDs to their position in segments array for O(1) updates
+// - segments: The output array being built
+interface ProcessToolEventContext {
+  toolMap: Map<string, ToolAggregate>;
+  pendingChildren: Map<string, ToolAggregate[]>;
+  segmentIndexByToolId: Map<string, number>;
+  segments: MessageSegment[];
+}
+
+const updateSegmentTool = (
+  toolId: string,
+  updatedTool: ToolAggregate,
+  segments: MessageSegment[],
+  segmentIndexByToolId: Map<string, number>,
+): void => {
+  const segmentIndex = segmentIndexByToolId.get(toolId);
+  if (segmentIndex !== undefined && segments[segmentIndex].kind === 'tool') {
+    segments[segmentIndex] = {
+      ...segments[segmentIndex],
+      tool: updatedTool,
+    } as ToolSegment;
+  }
+};
+
+// Recursively updates all ancestors when a child tool changes.
+// When a nested tool updates, its parent's children array must reflect the change,
+// and that parent's parent must also update, continuing up the chain.
+const updateParentChain = (
+  childAggregate: ToolAggregate,
+  toolMap: Map<string, ToolAggregate>,
+  segments: MessageSegment[],
+  segmentIndexByToolId: Map<string, number>,
+): void => {
+  if (!childAggregate.parentId) return;
+
+  const parent = toolMap.get(childAggregate.parentId);
+  if (!parent) return;
+
+  const updatedParent = {
+    ...parent,
+    children: parent.children.map((child) =>
+      child.id === childAggregate.id ? childAggregate : child,
+    ),
+  };
+
+  toolMap.set(childAggregate.parentId, updatedParent);
+  updateSegmentTool(childAggregate.parentId, updatedParent, segments, segmentIndexByToolId);
+  updateParentChain(updatedParent, toolMap, segments, segmentIndexByToolId);
+};
+
+const createToolAggregate = (
+  payload: Extract<
+    AssistantStreamEvent,
+    { type: 'tool_started' | 'tool_completed' | 'tool_failed' }
+  >['tool'],
+  status: ToolEventStatus,
+  parentId: string | null,
+): ToolAggregate => ({
+  id: payload.id,
+  name: payload.name,
+  title: payload.title,
+  status,
+  parentId,
+  input: (payload.input || null) as Record<string, unknown> | null,
+  result: payload.result,
+  error: payload.error,
+  children: [],
+});
+
+// Attaches any children that arrived before this parent tool was created.
+// Tool events can arrive out of order (child before parent), so we queue
+// orphaned children in pendingChildren and attach them when the parent arrives.
+const attachPendingChildren = (
+  aggregate: ToolAggregate,
+  pendingChildren: Map<string, ToolAggregate[]>,
+): ToolAggregate => {
+  const waitingChildren = pendingChildren.get(aggregate.id);
+  if (!waitingChildren || waitingChildren.length === 0) return aggregate;
+
+  const updated = {
+    ...aggregate,
+    children: [...aggregate.children, ...waitingChildren],
+  };
+  pendingChildren.delete(aggregate.id);
+  return updated;
+};
+
+// Links a child tool to its parent. If the parent exists, adds child to its children array.
+// If the parent hasn't arrived yet, queues the child in pendingChildren for later attachment.
+const addChildToParent = (
+  child: ToolAggregate,
+  parentId: string,
+  context: ProcessToolEventContext,
+): void => {
+  const { toolMap, pendingChildren, segments, segmentIndexByToolId } = context;
+  const parent = toolMap.get(parentId);
+
+  if (parent) {
+    const alreadyAttached = parent.children.some((existing) => existing.id === child.id);
+    if (!alreadyAttached) {
+      const updatedParent = {
+        ...parent,
+        children: [...parent.children, child],
+      };
+      toolMap.set(parentId, updatedParent);
+      updateSegmentTool(parentId, updatedParent, segments, segmentIndexByToolId);
+
+      if (updatedParent.parentId) {
+        updateParentChain(updatedParent, toolMap, segments, segmentIndexByToolId);
+      }
+    }
+  } else {
+    const queue = pendingChildren.get(parentId) ?? [];
+    queue.push(child);
+    pendingChildren.set(parentId, queue);
+  }
+};
+
+const removeFromPreviousParent = (
+  toolId: string,
+  previousParentId: string,
+  context: ProcessToolEventContext,
+): void => {
+  const { toolMap, segments, segmentIndexByToolId } = context;
+  const previousParent = toolMap.get(previousParentId);
+
+  if (previousParent) {
+    const updatedParent = {
+      ...previousParent,
+      children: previousParent.children.filter((child) => child.id !== toolId),
+    };
+    toolMap.set(previousParentId, updatedParent);
+    updateSegmentTool(previousParentId, updatedParent, segments, segmentIndexByToolId);
+
+    if (updatedParent.parentId) {
+      updateParentChain(updatedParent, toolMap, segments, segmentIndexByToolId);
+    }
+  }
+};
+
+// Removes a tool from the root-level segments array when it becomes a child of another tool.
+// After removal, shifts all subsequent segment indices down by 1 to maintain correct mappings.
+const removeToolFromRootSegments = (
+  toolId: string,
+  segmentIndexByToolId: Map<string, number>,
+  segments: MessageSegment[],
+): void => {
+  const rootIndex = segmentIndexByToolId.get(toolId);
+  if (rootIndex === undefined) return;
+
+  segments.splice(rootIndex, 1);
+  segmentIndexByToolId.delete(toolId);
+
+  // Shift indices for all segments after the removed one
+  segmentIndexByToolId.forEach((idx, id) => {
+    if (idx > rootIndex) {
+      segmentIndexByToolId.set(id, idx - 1);
+    }
+  });
+};
+
+// Handles reassignment of a tool's parent when the parent_id changes mid-stream.
+// This can happen when the backend corrects tool hierarchy. The function:
+// 1. Removes the tool from its previous parent's children (if any)
+// 2. Either adds it to the new parent or promotes it to root level
+const handleParentChange = (
+  aggregate: ToolAggregate,
+  incomingParentId: string | null,
+  previousParentId: string | null,
+  context: ProcessToolEventContext,
+): void => {
+  if (previousParentId && previousParentId !== incomingParentId) {
+    removeFromPreviousParent(aggregate.id, previousParentId, context);
+  }
+
+  if (incomingParentId) {
+    removeToolFromRootSegments(aggregate.id, context.segmentIndexByToolId, context.segments);
+    addChildToParent(aggregate, incomingParentId, context);
+  } else if (!context.segmentIndexByToolId.has(aggregate.id)) {
+    context.segments.push({ kind: 'tool', id: `tool-${aggregate.id}`, tool: aggregate });
+    context.segmentIndexByToolId.set(aggregate.id, context.segments.length - 1);
+  }
+};
+
+const processNewTool = (
+  payload: Extract<
+    AssistantStreamEvent,
+    { type: 'tool_started' | 'tool_completed' | 'tool_failed' }
+  >['tool'],
+  toolStatus: ToolEventStatus,
+  parentId: string | null,
+  context: ProcessToolEventContext,
+): void => {
+  const { toolMap, segments, segmentIndexByToolId } = context;
+
+  let newAggregate = createToolAggregate(payload, toolStatus, parentId);
+  newAggregate = attachPendingChildren(newAggregate, context.pendingChildren);
+  toolMap.set(payload.id, newAggregate);
+
+  if (parentId) {
+    addChildToParent(newAggregate, parentId, context);
+  } else {
+    segments.push({ kind: 'tool', id: `tool-${newAggregate.id}`, tool: newAggregate });
+    segmentIndexByToolId.set(newAggregate.id, segments.length - 1);
+  }
+};
+
+const processExistingTool = (
+  payload: Extract<
+    AssistantStreamEvent,
+    { type: 'tool_started' | 'tool_completed' | 'tool_failed' }
+  >['tool'],
+  existingAggregate: ToolAggregate,
+  toolStatus: ToolEventStatus,
+  context: ProcessToolEventContext,
+): void => {
+  const { toolMap, segments, segmentIndexByToolId } = context;
+
+  const updatedAggregate: ToolAggregate = {
+    ...existingAggregate,
+    status: toolStatus,
+    input: payload.input ? (payload.input as Record<string, unknown>) : existingAggregate.input,
+    result: payload.result !== undefined ? payload.result : existingAggregate.result,
+    error: payload.error || existingAggregate.error,
+  };
+
+  if (payload.parent_id !== undefined) {
+    const incomingParentId = payload.parent_id ?? null;
+    if (existingAggregate.parentId !== incomingParentId) {
+      updatedAggregate.parentId = incomingParentId;
+      handleParentChange(
+        updatedAggregate,
+        incomingParentId,
+        existingAggregate.parentId ?? null,
+        context,
+      );
+    }
+  }
+
+  toolMap.set(payload.id, updatedAggregate);
+  updateSegmentTool(payload.id, updatedAggregate, segments, segmentIndexByToolId);
+
+  if (updatedAggregate.parentId) {
+    updateParentChain(updatedAggregate, toolMap, segments, segmentIndexByToolId);
+  }
+};
+
+// Main entry point for processing tool events. Routes to either processNewTool
+// (first time seeing this tool ID) or processExistingTool (updating status/result).
+const processToolEvent = (
+  event: Extract<AssistantStreamEvent, { type: 'tool_started' | 'tool_completed' | 'tool_failed' }>,
+  context: ProcessToolEventContext,
+): void => {
+  const { toolMap } = context;
+  const payload = event.tool;
+  const toolStatus = statusMap[event.type];
+  const parentId = payload.parent_id ?? null;
+  const existingAggregate = toolMap.get(payload.id);
+
+  if (!existingAggregate) {
+    processNewTool(payload, toolStatus, parentId, context);
+  } else {
+    processExistingTool(payload, existingAggregate, toolStatus, context);
+  }
+};
+
+// Transforms a flat array of stream events into structured segments for rendering.
+// Handles text batching, tool hierarchy construction (including out-of-order events),
+// and produces segments of type: text, thinking, tool, or review.
+export const buildSegments = (events: AssistantStreamEvent[]): MessageSegment[] => {
+  const segments: MessageSegment[] = [];
+  const toolMap = new Map<string, ToolAggregate>();
+  const segmentIndexByToolId = new Map<string, number>();
+  const pendingChildren = new Map<string, ToolAggregate[]>();
+  let pendingText = '';
+  let textSegmentCount = 0;
+  let thinkingSegmentCount = 0;
+  let reviewSegmentCount = 0;
+
+  const flushText = () => {
+    if (!pendingText) return;
+    segments.push({
+      kind: 'text',
+      id: `text-${textSegmentCount}`,
+      text: pendingText,
+    });
+    textSegmentCount++;
+    pendingText = '';
+  };
+
+  const context: ProcessToolEventContext = {
+    toolMap,
+    pendingChildren,
+    segmentIndexByToolId,
+    segments,
+  };
+
+  events.forEach((event, index) => {
+    switch (event.type) {
+      case 'assistant_text':
+        pendingText += event.text;
+        break;
+      case 'assistant_thinking':
+        flushText();
+        segments.push({
+          kind: 'thinking',
+          id: `thinking-${thinkingSegmentCount}`,
+          text: event.thinking,
+          eventIndex: index,
+        });
+        thinkingSegmentCount++;
+        break;
+      case 'code_review':
+        flushText();
+        segments.push({
+          kind: 'review',
+          id: `review-${reviewSegmentCount}`,
+          reviews: event.reviews,
+          eventIndex: index,
+        });
+        reviewSegmentCount++;
+        break;
+      case 'tool_started':
+      case 'tool_completed':
+      case 'tool_failed':
+        flushText();
+        processToolEvent(event, context);
+        break;
+      case 'user_text':
+        pendingText += event.text;
+        break;
+      default:
+        break;
+    }
+  });
+
+  flushText();
+  return segments;
+};

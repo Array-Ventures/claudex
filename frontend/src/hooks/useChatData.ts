@@ -1,0 +1,54 @@
+import { useMemo } from 'react';
+import { useInfiniteChatsQuery, useInfiniteMessagesQuery, useChatQuery } from '@/hooks/queries';
+import type { Chat as ChatSummary, Message } from '@/types';
+
+interface UseChatDataResult {
+  chats: ChatSummary[];
+  currentChat: ChatSummary | undefined;
+  fetchedMessages: Message[];
+  hasFetchedMessages: boolean;
+  chatsQueryMeta: {
+    fetchNextPage: ReturnType<typeof useInfiniteChatsQuery>['fetchNextPage'];
+    hasNextPage: ReturnType<typeof useInfiniteChatsQuery>['hasNextPage'];
+    isFetchingNextPage: ReturnType<typeof useInfiniteChatsQuery>['isFetchingNextPage'];
+  };
+  messagesQuery: ReturnType<typeof useInfiniteMessagesQuery>;
+}
+
+export function useChatData(chatId: string | undefined): UseChatDataResult {
+  const chatsQuery = useInfiniteChatsQuery();
+  const messagesQuery = useInfiniteMessagesQuery(chatId || '');
+
+  const chats = useMemo(
+    () => chatsQuery.data?.pages?.flatMap((page) => page.items) ?? [],
+    [chatsQuery.data?.pages],
+  );
+  const fetchedMessages = useMemo(
+    () => messagesQuery.data?.pages?.flatMap((page) => page.items) ?? [],
+    [messagesQuery.data?.pages],
+  );
+
+  const currentChatFromList = useMemo(
+    () => chats.find((chat) => chat.id === chatId),
+    [chats, chatId],
+  );
+
+  const singleChatQuery = useChatQuery(chatId || '', {
+    enabled: !!chatId && !currentChatFromList,
+  });
+
+  const currentChat = currentChatFromList ?? singleChatQuery.data;
+
+  return {
+    chats,
+    currentChat,
+    fetchedMessages,
+    hasFetchedMessages: fetchedMessages.length > 0,
+    chatsQueryMeta: {
+      fetchNextPage: chatsQuery.fetchNextPage,
+      hasNextPage: chatsQuery.hasNextPage,
+      isFetchingNextPage: chatsQuery.isFetchingNextPage,
+    },
+    messagesQuery,
+  };
+}

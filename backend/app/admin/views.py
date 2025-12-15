@@ -1,0 +1,412 @@
+from enum import Enum
+from typing import Any, TypeVar
+
+from sqladmin import ModelView
+from app.models.db_models import (
+    AIModel,
+    User,
+    Chat,
+    Message,
+    MessageAttachment,
+    UserSettings,
+)
+from wtforms import PasswordField, SelectField
+from app.models.db_models.enums import (
+    ModelProvider,
+    MessageRole,
+    MessageStreamStatus,
+    AttachmentType,
+)
+from markupsafe import Markup
+from app.core.security import get_password_hash
+from datetime import datetime, timezone
+from sqlalchemy import Select, select
+from sqlalchemy.orm import selectinload
+from starlette.requests import Request
+
+
+E = TypeVar("E", bound=Enum)
+
+
+def _coerce_enum(enum_class: type[E]) -> Any:
+    def coerce(value: E | str) -> str:
+        if isinstance(value, enum_class):
+            return str(value.value)
+        return str(value)
+
+    return coerce
+
+
+def _calculate_remaining_messages(user: User) -> str | int:
+    if user.daily_message_limit is None:
+        return "Unlimited"
+
+    limit: int = user.daily_message_limit
+    if not hasattr(user, "chats"):
+        return limit
+
+    today_start = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    today_end = datetime.now(timezone.utc).replace(
+        hour=23, minute=59, second=59, microsecond=999999
+    )
+
+    total_messages_today = 0
+    for chat in user.chats:
+        for message in chat.messages:
+            if (
+                message.created_at
+                and message.created_at >= today_start
+                and message.created_at <= today_end
+                and message.role.value == "user"
+            ):
+                total_messages_today += 1
+
+    return max(0, limit - total_messages_today)
+
+
+class AIModelAdmin(ModelView, model=AIModel):
+    column_list = [
+        "id",
+        "model_id",
+        "name",
+        "provider",
+        "is_active",
+        "sort_order",
+        "created_at",
+        "updated_at",
+    ]
+    column_searchable_list = ["model_id", "name"]
+    column_sortable_list = [
+        "model_id",
+        "name",
+        "provider",
+        "is_active",
+        "sort_order",
+        "created_at",
+        "updated_at",
+    ]
+    column_default_sort = [("sort_order", False)]
+
+    column_formatters = {
+        "provider": lambda m, a: m.provider.value if m.provider else "",
+        "created_at": lambda m, a: m.created_at.strftime("%Y-%m-%d %H:%M:%S")
+        if m.created_at
+        else "",
+        "updated_at": lambda m, a: m.updated_at.strftime("%Y-%m-%d %H:%M:%S")
+        if m.updated_at
+        else "",
+    }
+
+    column_labels = {
+        "model_id": "Model ID",
+        "is_active": "Active",
+        "sort_order": "Sort Order",
+    }
+
+    form_overrides = {
+        "provider": SelectField,
+    }
+
+    form_args = {
+        "provider": {
+            "choices": [(p.value, p.value) for p in ModelProvider],
+            "coerce": _coerce_enum(ModelProvider),
+        },
+    }
+
+    name = "AI Model"
+    name_plural = "AI Models"
+    icon = "fa-solid fa-robot"
+
+
+class UserAdmin(ModelView, model=User):
+    column_list = [
+        "id",
+        "email",
+        "is_superuser",
+        "daily_message_limit",
+        "remaining_messages_today",
+        "created_at",
+        "updated_at",
+    ]
+    column_searchable_list = ["email"]
+    column_sortable_list = [
+        "id",
+        "email",
+        "is_superuser",
+        "daily_message_limit",
+        "remaining_messages_today",
+        "created_at",
+        "updated_at",
+    ]
+    column_default_sort = [("email", False)]
+
+    column_formatters = {
+        "created_at": lambda m, a: m.created_at.strftime("%Y-%m-%d %H:%M:%S")
+        if m.created_at
+        else "",
+        "updated_at": lambda m, a: m.updated_at.strftime("%Y-%m-%d %H:%M:%S")
+        if m.updated_at
+        else "",
+        "daily_message_limit": lambda m, a: "Unlimited"
+        if m.daily_message_limit is None
+        else f"{m.daily_message_limit}",
+        "remaining_messages_today": lambda m, a: f"{_calculate_remaining_messages(m)}",
+    }
+
+    form_excluded_columns = ["chats", "settings", "hashed_password"]
+
+    form_extra_fields = {"password": PasswordField("Password")}
+
+    async def on_model_change(
+        self, data: dict[str, Any], model: User, is_created: bool, request: Request
+    ) -> None:
+        if "password" in data and data["password"]:
+            data["hashed_password"] = get_password_hash(data["password"])
+            del data["password"]
+        await super().on_model_change(data, model, is_created, request)
+
+    def list_query(self, request: Request) -> Select[tuple[User]]:
+        return select(User).options(
+            selectinload(User.chats).selectinload(Chat.messages)
+        )
+
+    name = "User"
+    name_plural = "Users"
+    icon = "fa-solid fa-user"
+
+
+class ChatAdmin(ModelView, model=Chat):
+    column_list = [
+        "id",
+        "title",
+        "user_id",
+        "context_token_usage",
+        "created_at",
+        "updated_at",
+        "sandbox_id",
+        "deleted_at",
+    ]
+    column_searchable_list = ["title"]
+    column_sortable_list = [
+        "created_at",
+        "updated_at",
+        "title",
+        "context_token_usage",
+        "deleted_at",
+    ]
+    column_default_sort = [("created_at", True)]
+
+    column_formatters = {
+        "created_at": lambda m, a: m.created_at.strftime("%Y-%m-%d %H:%M:%S")
+        if m.created_at
+        else "",
+        "updated_at": lambda m, a: m.updated_at.strftime("%Y-%m-%d %H:%M:%S")
+        if m.updated_at
+        else "",
+        "deleted_at": lambda m, a: m.deleted_at.strftime("%Y-%m-%d %H:%M:%S")
+        if m.deleted_at
+        else "",
+        "context_token_usage": lambda m, a: f"{m.context_token_usage:,} tokens"
+        if m.context_token_usage is not None
+        else "",
+    }
+
+    column_details_list = [
+        "id",
+        "title",
+        "user_id",
+        "context_token_usage",
+        "created_at",
+        "updated_at",
+        "sandbox_id",
+        "session_id",
+        "deleted_at",
+        "messages",
+    ]
+
+    column_formatters_detail = {
+        "user_id": lambda m, a: Markup(
+            f'<a href="/admin/user/details/{m.user_id}">{m.user_id}</a>'
+        )
+        if m.user_id
+        else ""
+    }
+
+    inline_models = [
+        (
+            Message,
+            {
+                "fields": [
+                    "role",
+                    "content",
+                    "model_id",
+                    "total_cost_usd",
+                    "stream_status",
+                    "created_at",
+                ],
+                "form_columns": ["role", "content", "model_id"],
+                "column_labels": {
+                    "role": "Role",
+                    "content": "Message",
+                    "model_id": "Model",
+                    "total_cost_usd": "Cost (USD)",
+                    "stream_status": "Status",
+                    "created_at": "Sent At",
+                },
+            },
+        )
+    ]
+
+    name = "Chat"
+    name_plural = "Chats"
+    icon = "fa-solid fa-comments"
+
+
+class MessageAdmin(ModelView, model=Message):
+    column_list = [
+        "id",
+        "chat_id",
+        "role",
+        "content",
+        "total_cost_usd",
+        "stream_status",
+        "created_at",
+        "updated_at",
+        "model_id",
+    ]
+
+    column_formatters = {
+        "content": lambda m, a: m.content[:100] + "..."
+        if len(m.content) > 100
+        else m.content,
+        "total_cost_usd": lambda m, a: f"${m.total_cost_usd:.4f}"
+        if m.total_cost_usd is not None
+        else "$0.0000",
+        "stream_status": lambda m, a: m.stream_status.value if m.stream_status else "",
+        "created_at": lambda m, a: m.created_at.strftime("%Y-%m-%d %H:%M:%S")
+        if m.created_at
+        else "",
+        "updated_at": lambda m, a: m.updated_at.strftime("%Y-%m-%d %H:%M:%S")
+        if m.updated_at
+        else "",
+    }
+
+    column_searchable_list = ["content"]
+    column_sortable_list = [
+        "created_at",
+        "updated_at",
+        "total_cost_usd",
+        "stream_status",
+    ]
+    column_default_sort = [("created_at", True)]
+
+    column_labels = {
+        "total_cost_usd": "Cost (USD)",
+        "stream_status": "Stream Status",
+    }
+
+    form_overrides = {
+        "role": SelectField,
+        "stream_status": SelectField,
+    }
+
+    form_args = {
+        "role": {
+            "choices": [(r.value, r.value) for r in MessageRole],
+            "coerce": _coerce_enum(MessageRole),
+        },
+        "stream_status": {
+            "choices": [(s.value, s.value) for s in MessageStreamStatus],
+            "coerce": _coerce_enum(MessageStreamStatus),
+        },
+    }
+
+    can_export = True
+    column_export_list = [
+        "id",
+        "chat_id",
+        "role",
+        "content",
+        "total_cost_usd",
+        "stream_status",
+        "created_at",
+        "updated_at",
+        "model_id",
+    ]
+
+    name = "Message"
+    name_plural = "Messages"
+    icon = "fa-solid fa-message"
+
+
+class MessageAttachmentAdmin(ModelView, model=MessageAttachment):
+    column_list = [
+        "id",
+        "message_id",
+        "filename",
+        "file_type",
+        "created_at",
+        "updated_at",
+    ]
+
+    column_formatters = {
+        "created_at": lambda m, a: m.created_at.strftime("%Y-%m-%d %H:%M:%S")
+        if m.created_at
+        else "",
+        "updated_at": lambda m, a: m.updated_at.strftime("%Y-%m-%d %H:%M:%S")
+        if m.updated_at
+        else "",
+    }
+
+    column_searchable_list = ["filename"]
+    column_sortable_list = [
+        "created_at",
+        "updated_at",
+        "filename",
+    ]
+    column_default_sort = [("created_at", True)]
+
+    form_overrides = {
+        "file_type": SelectField,
+    }
+
+    form_args = {
+        "file_type": {
+            "choices": [(t.value, t.value) for t in AttachmentType],
+            "coerce": _coerce_enum(AttachmentType),
+        },
+    }
+
+    name = "Message Attachment"
+    name_plural = "Message Attachments"
+    icon = "fa-solid fa-paperclip"
+
+
+class UserSettingsAdmin(ModelView, model=UserSettings):
+    column_list = [
+        "id",
+        "user_id",
+        "created_at",
+        "updated_at",
+    ]
+
+    column_formatters = {
+        "created_at": lambda m, a: m.created_at.strftime("%Y-%m-%d %H:%M:%S")
+        if m.created_at
+        else "",
+        "updated_at": lambda m, a: m.updated_at.strftime("%Y-%m-%d %H:%M:%S")
+        if m.updated_at
+        else "",
+    }
+
+    form_args = {
+        "github_personal_access_token": {"label": "GitHub Token"},
+        "e2b_api_key": {"label": "E2B API Key"},
+    }
+
+    name = "User Settings"
+    name_plural = "User Settings"
+    icon = "fa-solid fa-gear"

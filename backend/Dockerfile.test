@@ -1,0 +1,48 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install system dependencies and Node.js
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    gcc \
+    libpq-dev \
+    curl \
+    git \
+    gnupg \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Claude CLI globally
+RUN npm install -g @anthropic-ai/claude-code
+
+# Install uv package manager
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Copy requirements files
+COPY requirements.txt requirements-test.txt ./
+
+# Install Python dependencies
+RUN /root/.local/bin/uv pip install --system --no-cache -r requirements-test.txt
+
+# Copy application code
+COPY . .
+
+# Set Python path
+ENV PYTHONPATH=/app
+
+# Create necessary directories
+RUN mkdir -p /home/appuser/storage/images /home/appuser/storage/pdfs /home/appuser/storage/xlsx
+
+# Create a non-root user for running tests
+RUN useradd -m -u 1000 testuser && chown -R testuser:testuser /app
+
+# Create appuser directory and give testuser ownership
+RUN mkdir -p /home/appuser && chown -R testuser:testuser /home/appuser
+
+USER testuser
+
+# Default command runs pytest
+CMD ["pytest", "-v"]

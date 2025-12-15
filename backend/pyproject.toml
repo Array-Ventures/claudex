@@ -1,0 +1,114 @@
+[tool.ruff]
+# Same as Black.
+line-length = 88
+
+# Exclude a variety of commonly ignored directories.
+exclude = [
+    ".git",
+    ".ruff_cache",
+    "__pycache__",
+    "migrations",
+    "venv",
+    "env",
+    ".env",
+    ".venv",
+]
+
+# Assume Python 3.13
+target-version = "py313"
+
+[tool.ruff.lint]
+# Enable flake8-bugbear (`B`) rules.
+select = ["E", "F", "B"]
+
+# Allow unused variables when underscore-prefixed.
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+# Ignore specific rules that are common in FastAPI apps
+ignore = [
+    "B008",  # Do not perform function call in argument defaults (common in FastAPI with Depends)
+    "E501",  # Line too long (handled by formatter)
+    "B904",  # Use 'raise ... from err' (would require many changes)
+    "B006",  # Do not use mutable data structures for argument defaults
+]
+
+[tool.ruff.lint.mccabe]
+# Unlike Flake8, default to a complexity level of 10.
+max-complexity = 10
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402", "F401"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-n auto --strict-markers --tb=short --disable-warnings -v"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+    "ignore::RuntimeWarning",
+    "ignore::sqlalchemy.exc.SAWarning",
+]
+
+[tool.coverage.run]
+source = ["app"]
+omit = [
+    "app/migrations/*",
+    "app/admin/*",
+    "app/__init__.py",
+]
+
+[tool.coverage.report]
+fail_under = 70
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
+
+[tool.mypy]
+python_version = "3.13"
+strict_optional = true
+check_untyped_defs = true
+warn_return_any = true
+warn_unused_ignores = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unreachable = true
+show_error_codes = true
+ignore_missing_imports = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_any_generics = true
+strict_equality = true
+extra_checks = true
+exclude = [
+    "migrations/",
+    "tests/",
+    "venv/",
+]
+[[tool.mypy.overrides]]
+module = [
+    "celery.*",
+    "redis.*",
+    "sqladmin.*",
+    "e2b.*",
+    "sse_starlette.*",
+    "prometheus_fastapi_instrumentator.*",
+    "granian.*",
+    "claude_agent_sdk.*",
+    "yaml",
+    "fastapi_users.*",
+    "fastapi_users_db_sqlalchemy.*",
+]
+ignore_missing_imports = true
+
+# sqladmin uses metaclass magic for ModelView(model=Model) syntax that mypy cannot understand
+# See: https://github.com/python/mypy/issues/11057
+[[tool.mypy.overrides]]
+module = "app.admin.views"
+disable_error_code = ["call-arg"]

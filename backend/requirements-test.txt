@@ -1,0 +1,15 @@
+-r requirements.txt
+
+# Testing dependencies
+pytest
+pytest-asyncio
+pytest-cov
+pytest-xdist
+pytest-testmon
+pytest-recording>=0.13.0
+vcrpy>=6.0.0
+filelock
+faker
+factory-boy
+beautifulsoup4
+ruff

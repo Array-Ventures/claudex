@@ -1,0 +1,548 @@
+from __future__ import annotations
+
+import asyncio
+import os
+import uuid
+from contextlib import asynccontextmanager
+from typing import Any, AsyncGenerator, Callable, Generator
+
+import pytest
+import pytest_asyncio
+from e2b import AsyncSandbox
+from filelock import FileLock
+from httpx import ASGITransport, AsyncClient
+from redis.asyncio import Redis
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
+
+os.environ.setdefault("ENVIRONMENT", "development")
+os.environ.setdefault(
+    "SECRET_KEY", "test_secret_key_for_testing_at_least_32_characters_long"
+)
+os.environ.setdefault(
+    "DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5433/claudex_test"
+)
+os.environ.setdefault("REDIS_URL", "redis://localhost:6380/0")
+os.environ.setdefault("REQUIRE_EMAIL_VERIFICATION", "false")
+os.environ.setdefault("BLOCK_DISPOSABLE_EMAILS", "false")
+os.environ.setdefault("LOG_LEVEL", "ERROR")
+os.environ.setdefault("STORAGE_PATH", "/tmp/test_storage")
+os.environ.setdefault("MAIL_PASSWORD", "test_sendgrid_api_key")
+
+from app.api.endpoints import auth as auth_module
+from app.constants import SANDBOX_AUTO_PAUSE_TIMEOUT
+from app.core.config import get_settings
+from app.core.deps import (
+    get_ai_model_service,
+    get_chat_service,
+    get_sandbox_service,
+    get_user_service,
+)
+from app.core.security import get_password_hash
+from app.core.user_manager import get_jwt_strategy
+from app.db.base import Base
+from app.db.session import get_db
+from app.main import create_application
+from app.models.db_models import Chat, Message, User, UserSettings
+from app.models.db_models.ai_model import AIModel
+from app.models.db_models.enums import MessageRole, MessageStreamStatus, ModelProvider
+from app.services.ai_model import AIModelService
+from app.services.chat import ChatService
+from app.services.claude_agent import ClaudeAgentService
+from app.services.sandbox import SandboxService
+from app.services.storage import StorageService
+from app.services.user import UserService
+
+settings = get_settings()
+
+TEST_PASSWORD = "testpassword"
+TEST_PASSWORD_ALT = "testpassword123"
+STREAMING_TEST_TIMEOUT = 180
+
+ChatServiceClass = type[ChatService]
+
+
+@pytest.fixture(scope="session")
+def event_loop() -> Generator:
+    policy = asyncio.get_event_loop_policy()
+    loop = policy.new_event_loop()
+    yield loop
+    loop.close()
+
+
+test_engine = create_async_engine(
+    settings.DATABASE_URL,
+    poolclass=NullPool,
+    echo=False,
+)
+
+TestSessionLocal = sessionmaker(
+    test_engine,
+    class_=AsyncSession,
+    autocommit=False,
+    autoflush=False,
+    expire_on_commit=False,
+)
+
+
+@pytest.fixture(scope="session")
+def _setup_test_database(tmp_path_factory):
+    lock_file = tmp_path_factory.getbasetemp().parent / "db_setup.lock"
+    done_file = tmp_path_factory.getbasetemp().parent / "db_setup.done"
+
+    with FileLock(str(lock_file)):
+        if not done_file.exists():
+
+            async def setup():
+                async with test_engine.begin() as conn:
+                    await conn.run_sync(Base.metadata.drop_all)
+                    await conn.run_sync(Base.metadata.create_all)
+
+            asyncio.get_event_loop().run_until_complete(setup())
+            done_file.touch()
+
+    yield
+
+    with FileLock(str(lock_file)):
+        if done_file.exists():
+
+            async def teardown():
+                async with test_engine.begin() as conn:
+                    await conn.run_sync(Base.metadata.drop_all)
+
+            asyncio.get_event_loop().run_until_complete(teardown())
+            done_file.unlink(missing_ok=True)
+
+
+@pytest_asyncio.fixture(scope="function")
+async def db_session(_setup_test_database) -> AsyncGenerator[AsyncSession, None]:
+    connection = await test_engine.connect()
+    transaction = await connection.begin()
+
+    session = TestSessionLocal(bind=connection)
+
+    try:
+        yield session
+    finally:
+        try:
+            if session.in_transaction():
+                await session.rollback()
+        except Exception:
+            pass
+        await session.close()
+        try:
+            await transaction.rollback()
+        except Exception:
+            pass
+        await connection.close()
+
+
+@pytest.fixture
+def session_factory(db_session: AsyncSession) -> Callable[[], Any]:
+    @asynccontextmanager
+    async def factory():
+        yield db_session
+
+    return factory
+
+
+@pytest_asyncio.fixture
+async def sample_user(db_session: AsyncSession) -> User:
+    user = User(
+        id=uuid.uuid4(),
+        email="test@example.com",
+        username="testuser",
+        hashed_password=get_password_hash(TEST_PASSWORD_ALT),
+        is_active=True,
+        is_verified=True,
+        is_superuser=False,
+    )
+    db_session.add(user)
+
+    user_settings = UserSettings(
+        id=uuid.uuid4(),
+        user_id=user.id,
+        e2b_api_key="test_e2b_api_key",
+        claude_code_oauth_token="test_claude_code_oauth_token",
+    )
+    db_session.add(user_settings)
+
+    await db_session.flush()
+    await db_session.refresh(user)
+    return user
+
+
+@pytest_asyncio.fixture
+async def sample_chat(db_session: AsyncSession, sample_user: User) -> Chat:
+    chat = Chat(
+        id=uuid.uuid4(),
+        title="Test Chat",
+        user_id=sample_user.id,
+        context_token_usage=0,
+    )
+    db_session.add(chat)
+    await db_session.flush()
+    await db_session.refresh(chat)
+    return chat
+
+
+@pytest_asyncio.fixture
+async def sample_message(db_session: AsyncSession, sample_chat: Chat) -> Message:
+    message = Message(
+        id=uuid.uuid4(),
+        chat_id=sample_chat.id,
+        content="Test message content",
+        role=MessageRole.USER,
+        stream_status=MessageStreamStatus.COMPLETED,
+    )
+    db_session.add(message)
+    await db_session.flush()
+    await db_session.refresh(message)
+    return message
+
+
+@pytest_asyncio.fixture
+async def redis_client():
+    redis: Redis[str] = Redis.from_url(settings.REDIS_URL, decode_responses=True)
+    try:
+        yield redis
+    finally:
+        await redis.flushdb()
+        await redis.close()
+
+
+def create_e2e_application(
+    db_session: AsyncSession,
+    sandbox_service: SandboxService,
+    session_factory: Callable[[], Any],
+    chat_service_cls: ChatServiceClass = ChatService,
+):
+    application = create_application()
+
+    async def override_get_db():
+        yield db_session
+
+    async def override_get_sandbox_service():
+        yield sandbox_service
+
+    def override_get_user_service():
+        return UserService(session_factory=session_factory)
+
+    async def override_get_chat_service():
+        storage_service = StorageService(sandbox_service)
+        user_service = UserService(session_factory=session_factory)
+        ai_service = ClaudeAgentService(session_factory=session_factory)
+        yield chat_service_cls(
+            storage_service,
+            sandbox_service,
+            ai_service,
+            user_service,
+            session_factory=session_factory,
+        )
+
+    def override_get_ai_model_service():
+        return AIModelService(session_factory=session_factory)
+
+    application.dependency_overrides[get_db] = override_get_db
+    application.dependency_overrides[get_sandbox_service] = override_get_sandbox_service
+    application.dependency_overrides[get_user_service] = override_get_user_service
+    application.dependency_overrides[get_chat_service] = override_get_chat_service
+    application.dependency_overrides[get_ai_model_service] = (
+        override_get_ai_model_service
+    )
+
+    auth_module.limiter.enabled = False
+
+    return application
+
+
+class TestChatService(ChatService):
+    def __init__(
+        self,
+        storage_service,
+        sandbox_service,
+        ai_service,
+        user_service,
+        session_factory=None,
+    ):
+        super().__init__(
+            storage_service, sandbox_service, ai_service, user_service, session_factory
+        )
+        self._test_sandbox_service = sandbox_service
+        self._test_session_factory = session_factory
+
+    async def _enqueue_chat_task(
+        self,
+        *,
+        prompt,
+        system_prompt,
+        custom_instructions,
+        user,
+        chat,
+        permission_mode,
+        model_id,
+        session_id,
+        assistant_message_id,
+        thinking_mode,
+        attachments,
+    ):
+        import app.tasks.chat_processor as chat_processor_module
+        from unittest.mock import MagicMock
+
+        task_id = str(uuid.uuid4())
+        mock_task = MagicMock()
+        mock_task.request = MagicMock()
+        mock_task.request.id = task_id
+        mock_task.update_state = MagicMock()
+
+        user_data = {
+            "id": str(user.id),
+            "email": user.email,
+            "username": user.username,
+        }
+        chat_data = {
+            "id": str(chat.id),
+            "user_id": str(chat.user_id),
+            "title": chat.title,
+            "sandbox_id": chat.sandbox_id,
+            "session_id": chat.session_id,
+        }
+
+        @asynccontextmanager
+        async def mock_celery_session():
+            async with self._test_session_factory() as session:
+                yield self._test_session_factory, session.get_bind()
+
+        original_get_celery_session = chat_processor_module.get_celery_session
+
+        try:
+            chat_processor_module.get_celery_session = mock_celery_session
+            await chat_processor_module.process_chat_stream(
+                task=mock_task,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                custom_instructions=custom_instructions,
+                user_data=user_data,
+                chat_data=chat_data,
+                model_id=model_id,
+                permission_mode=permission_mode,
+                session_id=session_id,
+                assistant_message_id=assistant_message_id,
+                thinking_mode=thinking_mode,
+                attachments=attachments,
+                sandbox_service=self._test_sandbox_service,
+            )
+        finally:
+            chat_processor_module.get_celery_session = original_get_celery_session
+
+        mock_result = MagicMock()
+        mock_result.id = task_id
+        return mock_result
+
+
+class SessionSandboxManager:
+    def __init__(self, e2b_api_key: str):
+        self.e2b_api_key = e2b_api_key
+        self.sandbox_id: str | None = None
+        self.sandbox: AsyncSandbox | None = None
+        self.service = SandboxService(e2b_api_key=e2b_api_key)
+
+    async def get_sandbox(self) -> tuple[str, AsyncSandbox]:
+        if self.sandbox_id:
+            try:
+                self.sandbox = await AsyncSandbox.connect(
+                    sandbox_id=self.sandbox_id,
+                    api_key=self.e2b_api_key,
+                    timeout=SANDBOX_AUTO_PAUSE_TIMEOUT,
+                    auto_pause=True,
+                )
+                self.service._active_sandboxes[self.sandbox_id] = self.sandbox
+                return self.sandbox_id, self.sandbox
+            except Exception:
+                pass
+
+        self.sandbox = await AsyncSandbox.create(
+            api_key=self.e2b_api_key,
+            template=settings.E2B_TEMPLATE_ID,
+            timeout=SANDBOX_AUTO_PAUSE_TIMEOUT,
+            auto_pause=True,
+        )
+        self.sandbox_id = self.sandbox.sandbox_id
+        self.service._active_sandboxes[self.sandbox_id] = self.sandbox
+        return self.sandbox_id, self.sandbox
+
+    async def cleanup(self) -> None:
+        if self.sandbox:
+            try:
+                await self.sandbox.kill()
+            except Exception:
+                pass
+
+
+@pytest.fixture(scope="session")
+def e2b_api_key() -> str:
+    key = os.environ.get("E2B_API_KEY")
+    if not key:
+        pytest.skip("E2B_API_KEY required")
+    return key
+
+
+@pytest.fixture(scope="session")
+def claude_token() -> str:
+    token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if not token:
+        pytest.skip("CLAUDE_CODE_OAUTH_TOKEN required")
+    return token
+
+
+@pytest_asyncio.fixture
+async def seed_ai_models(db_session: AsyncSession) -> None:
+    models = [
+        AIModel(
+            id=uuid.uuid4(),
+            model_id="claude-haiku-4-5",
+            name="Claude Haiku 4.5",
+            provider=ModelProvider.ANTHROPIC,
+            is_active=True,
+            sort_order=0,
+        ),
+        AIModel(
+            id=uuid.uuid4(),
+            model_id="claude-sonnet-4-5",
+            name="Claude Sonnet 4.5",
+            provider=ModelProvider.ANTHROPIC,
+            is_active=True,
+            sort_order=1,
+        ),
+    ]
+    for model in models:
+        db_session.add(model)
+    await db_session.flush()
+
+
+@pytest_asyncio.fixture(scope="session")
+async def sandbox_manager(
+    e2b_api_key: str,
+) -> AsyncGenerator[SessionSandboxManager, None]:
+    manager = SessionSandboxManager(e2b_api_key)
+    await manager.get_sandbox()
+    try:
+        yield manager
+    finally:
+        await manager.cleanup()
+
+
+@pytest_asyncio.fixture
+async def real_sandbox(
+    sandbox_manager: SessionSandboxManager,
+) -> AsyncGenerator[tuple[SandboxService, str], None]:
+    sandbox_id, _ = await sandbox_manager.get_sandbox()
+    yield sandbox_manager.service, sandbox_id
+
+
+@pytest_asyncio.fixture
+async def integration_user_fixture(
+    db_session: AsyncSession,
+    e2b_api_key: str,
+    claude_token: str,
+    seed_ai_models: None,
+) -> User:
+    user = User(
+        id=uuid.uuid4(),
+        email=f"integration_{uuid.uuid4().hex[:8]}@example.com",
+        username=f"integration_{uuid.uuid4().hex[:8]}",
+        hashed_password=get_password_hash(TEST_PASSWORD),
+        is_active=True,
+        is_verified=True,
+    )
+    db_session.add(user)
+
+    user_settings = UserSettings(
+        id=uuid.uuid4(),
+        user_id=user.id,
+        e2b_api_key=e2b_api_key,
+        claude_code_oauth_token=claude_token,
+    )
+    db_session.add(user_settings)
+
+    await db_session.commit()
+    await db_session.refresh(user)
+    await db_session.refresh(user_settings)
+
+    return user
+
+
+@pytest_asyncio.fixture
+async def integration_chat_fixture(
+    db_session: AsyncSession,
+    integration_user_fixture: User,
+    real_sandbox: tuple[SandboxService, str],
+) -> AsyncGenerator[tuple[User, Chat, SandboxService], None]:
+    service, sandbox_id = real_sandbox
+    user = integration_user_fixture
+
+    chat = Chat(
+        id=uuid.uuid4(),
+        title="Integration Test Chat",
+        user_id=user.id,
+        sandbox_id=sandbox_id,
+    )
+    db_session.add(chat)
+    await db_session.flush()
+    await db_session.refresh(chat)
+
+    yield user, chat, service
+
+
+@pytest_asyncio.fixture
+async def e2e_app(
+    db_session: AsyncSession,
+    sandbox_manager: SessionSandboxManager,
+    session_factory: Callable[[], Any],
+    integration_user_fixture: User,
+):
+    await sandbox_manager.get_sandbox()
+    yield create_e2e_application(
+        db_session, sandbox_manager.service, session_factory, ChatService
+    )
+
+
+@pytest_asyncio.fixture
+async def async_client(e2e_app) -> AsyncGenerator[AsyncClient, None]:
+    async with AsyncClient(
+        transport=ASGITransport(app=e2e_app), base_url="http://test"
+    ) as ac:
+        yield ac
+
+
+@pytest_asyncio.fixture
+async def auth_headers(integration_user_fixture: User) -> dict[str, str]:
+    strategy = get_jwt_strategy()
+    token = await strategy.write_token(integration_user_fixture)
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest_asyncio.fixture
+async def e2e_streaming_app(
+    db_session: AsyncSession,
+    sandbox_manager: SessionSandboxManager,
+    session_factory: Callable[[], Any],
+    integration_user_fixture: User,
+):
+    await sandbox_manager.get_sandbox()
+    yield create_e2e_application(
+        db_session, sandbox_manager.service, session_factory, TestChatService
+    )
+
+
+@pytest_asyncio.fixture
+async def streaming_client(
+    e2e_streaming_app,
+) -> AsyncGenerator[AsyncClient, None]:
+    async with AsyncClient(
+        transport=ASGITransport(app=e2e_streaming_app),
+        base_url="http://test",
+        timeout=120.0,
+    ) as ac:
+        yield ac

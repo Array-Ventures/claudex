@@ -1,0 +1,687 @@
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { Settings as SettingsIcon, AlertCircle, FileText, FileArchive } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
+import type { UserSettings, UserSettingsUpdate } from '@/types';
+import {
+  useSettingsQuery,
+  useUpdateSettingsMutation,
+  useInfiniteChatsQuery,
+  useDeleteChatMutation,
+  useDeleteAllChatsMutation,
+} from '@/hooks/queries';
+import { Sidebar, useLayoutSidebar } from '@/components/layout';
+import {
+  Button,
+  ConfirmDialog,
+  ErrorBoundary,
+  Spinner,
+  SettingsUploadModal,
+} from '@/components/ui';
+import toast from 'react-hot-toast';
+import { GeneralSettingsTab } from '@/components/settings/tabs/GeneralSettingsTab';
+import { McpSettingsTab } from '@/components/settings/tabs/McpSettingsTab';
+import { AgentsSettingsTab } from '@/components/settings/tabs/AgentsSettingsTab';
+import { InstructionsSettingsTab } from '@/components/settings/tabs/InstructionsSettingsTab';
+import { EnvVarsSettingsTab } from '@/components/settings/tabs/EnvVarsSettingsTab';
+import { TasksSettingsTab } from '@/components/settings/tabs/TasksSettingsTab';
+import { AgentEditDialog } from '@/components/settings/dialogs/AgentEditDialog';
+import { McpDialog } from '@/components/settings/dialogs/McpDialog';
+import { EnvVarDialog } from '@/components/settings/dialogs/EnvVarDialog';
+import { TaskDialog } from '@/components/settings/dialogs/TaskDialog';
+import { SkillsSettingsTab } from '@/components/settings/tabs/SkillsSettingsTab';
+import { CommandsSettingsTab } from '@/components/settings/tabs/CommandsSettingsTab';
+import { CommandEditDialog } from '@/components/settings/dialogs/CommandEditDialog';
+import type { ApiFieldKey } from '@/types';
+import { useModelsQuery } from '@/hooks/queries';
+import { useCrudForm } from '@/hooks/useCrudForm';
+import { useTaskManagement } from '@/hooks/useTaskManagement';
+import { useFileResourceManagement } from '@/hooks/useFileResourceManagement';
+import { agentService } from '@/services/agentService';
+import { skillService } from '@/services/skillService';
+import { commandService } from '@/services/commandService';
+import {
+  getGeneralSecretFields,
+  createDefaultEnvVarForm,
+  validateEnvVarForm,
+  createDefaultMcpForm,
+  validateMcpForm,
+} from '@/utils/settings';
+
+type TabKey =
+  | 'general'
+  | 'mcp'
+  | 'agents'
+  | 'skills'
+  | 'commands'
+  | 'env_vars'
+  | 'instructions'
+  | 'tasks';
+
+const getErrorMessage = (error: unknown): string | undefined =>
+  error instanceof Error ? error.message : undefined;
+
+const createFallbackSettings = (): UserSettings => ({
+  id: '',
+  user_id: '',
+  github_personal_access_token: null,
+  e2b_api_key: null,
+  claude_code_oauth_token: null,
+  z_ai_api_key: null,
+  openrouter_api_key: null,
+  custom_instructions: null,
+  custom_agents: null,
+  custom_mcps: null,
+  custom_env_vars: null,
+  custom_skills: null,
+  custom_slash_commands: null,
+  notification_sound_enabled: true,
+  created_at: new Date().toISOString(),
+  updated_at: new Date().toISOString(),
+});
+
+const TAB_FIELDS: Record<TabKey, (keyof UserSettings)[]> = {
+  general: [
+    'e2b_api_key',
+    'github_personal_access_token',
+    'claude_code_oauth_token',
+    'z_ai_api_key',
+    'openrouter_api_key',
+    'notification_sound_enabled',
+  ],
+  mcp: ['custom_mcps'],
+  agents: ['custom_agents'],
+  skills: ['custom_skills'],
+  commands: ['custom_slash_commands'],
+  env_vars: ['custom_env_vars'],
+  instructions: ['custom_instructions'],
+  tasks: [],
+};
+
+const SettingsPage: React.FC = () => {
+  const navigate = useNavigate();
+  const { data: models = [] } = useModelsQuery();
+  const [activeTab, setActiveTab] = useState<TabKey>('general');
+  const [selectedChatId, setSelectedChatId] = useState<string | null>(null);
+  const [isDeleteAllDialogOpen, setIsDeleteAllDialogOpen] = useState(false);
+
+  const tabButtonClasses = (isActive: boolean) =>
+    `${
+      isActive
+        ? 'border-b-2 border-text-primary dark:border-text-dark-primary text-text-primary dark:text-text-dark-primary'
+        : 'text-text-tertiary dark:text-text-dark-tertiary hover:text-text-secondary dark:hover:text-text-dark-secondary'
+    } pb-2 text-xs font-medium transition-colors`;
+
+  const tabs: { id: TabKey; label: string }[] = [
+    { id: 'general', label: 'General' },
+    { id: 'mcp', label: 'MCP' },
+    { id: 'agents', label: 'Agents' },
+    { id: 'skills', label: 'Skills' },
+    { id: 'commands', label: 'Commands' },
+    { id: 'env_vars', label: 'Environment Variables' },
+    { id: 'instructions', label: 'Instructions' },
+    { id: 'tasks', label: 'Tasks' },
+  ];
+
+  const generalSecretFields = getGeneralSecretFields();
+
+  const { data: settings, isLoading: loading, error: fetchError } = useSettingsQuery();
+  const {
+    data: chatsData,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = useInfiniteChatsQuery();
+
+  const chats = useMemo(() => {
+    if (!chatsData?.pages) return [];
+    return chatsData.pages.flatMap((page) => page.items);
+  }, [chatsData?.pages]);
+
+  const { mutate: deleteChat } = useDeleteChatMutation();
+  const deleteAllChats = useDeleteAllChatsMutation();
+
+  const [localSettings, setLocalSettings] = useState<UserSettings>(
+    () => settings ?? createFallbackSettings(),
+  );
+  const localSettingsRef = useRef<UserSettings>(localSettings);
+
+  const defaultModelId = models.length > 0 ? models[0].model_id : '';
+
+  const manualUpdateMutation = useUpdateSettingsMutation({
+    onSuccess: (data) => {
+      toast.success('Settings saved successfully');
+      setLocalSettings(data);
+    },
+    onError: (error) => {
+      toast.error(getErrorMessage(error) || 'Failed to save settings');
+    },
+  });
+
+  const instantUpdateMutation = useUpdateSettingsMutation();
+
+  useEffect(() => {
+    localSettingsRef.current = localSettings;
+  }, [localSettings]);
+
+  const buildChangedPayload = useCallback(
+    (current: UserSettings, previous: UserSettings): UserSettingsUpdate => {
+      const payload: UserSettingsUpdate = {};
+      const fields: (keyof UserSettingsUpdate)[] = [
+        'github_personal_access_token',
+        'e2b_api_key',
+        'claude_code_oauth_token',
+        'z_ai_api_key',
+        'openrouter_api_key',
+        'custom_instructions',
+        'custom_agents',
+        'custom_mcps',
+        'custom_env_vars',
+        'custom_skills',
+        'custom_slash_commands',
+        'notification_sound_enabled',
+      ];
+
+      for (const field of fields) {
+        if (JSON.stringify(current[field]) !== JSON.stringify(previous[field])) {
+          payload[field] = (current[field] ?? null) as UserSettingsUpdate[typeof field];
+        }
+      }
+      return payload;
+    },
+    [],
+  );
+
+  const persistSettings = useCallback(
+    async (
+      updater: (previous: UserSettings) => UserSettings,
+      options: { successMessage?: string; errorMessage?: string } = {},
+    ) => {
+      const previousSettings = localSettingsRef.current ?? createFallbackSettings();
+      const updatedSettings = updater(previousSettings);
+
+      setLocalSettings(updatedSettings);
+      localSettingsRef.current = updatedSettings;
+
+      try {
+        const payload = buildChangedPayload(updatedSettings, previousSettings);
+        if (Object.keys(payload).length === 0) return;
+
+        const result = await instantUpdateMutation.mutateAsync(payload);
+        setLocalSettings(result);
+        localSettingsRef.current = result;
+        if (options.successMessage) {
+          toast.success(options.successMessage);
+        }
+      } catch (error) {
+        setLocalSettings(previousSettings);
+        localSettingsRef.current = previousSettings;
+        toast.error(options.errorMessage || getErrorMessage(error) || 'Failed to update settings');
+        throw error;
+      }
+    },
+    [instantUpdateMutation, buildChangedPayload],
+  );
+
+  const agentManagement = useFileResourceManagement(
+    localSettings,
+    persistSettings,
+    setLocalSettings,
+    {
+      settingsKey: 'custom_agents',
+      itemName: 'Agent',
+      maxItems: 10,
+      uploadFn: agentService.uploadAgent,
+      deleteFn: agentService.deleteAgent,
+      updateFn: agentService.updateAgent,
+    },
+  );
+
+  const mcpCrud = useCrudForm(localSettings, persistSettings, {
+    createDefault: createDefaultMcpForm,
+    validateForm: (form, editingIndex) =>
+      validateMcpForm(form, editingIndex, localSettings.custom_mcps || []),
+    getArrayKey: 'custom_mcps',
+    itemName: 'MCP',
+  });
+
+  const envVarCrud = useCrudForm(localSettings, persistSettings, {
+    createDefault: createDefaultEnvVarForm,
+    validateForm: (form, editingIndex) =>
+      validateEnvVarForm(form, editingIndex, localSettings.custom_env_vars || []),
+    getArrayKey: 'custom_env_vars',
+    itemName: 'environment variable',
+  });
+
+  const skillManagement = useFileResourceManagement(
+    localSettings,
+    persistSettings,
+    setLocalSettings,
+    {
+      settingsKey: 'custom_skills',
+      itemName: 'Skill',
+      maxItems: 10,
+      uploadFn: skillService.uploadSkill,
+      deleteFn: skillService.deleteSkill,
+    },
+  );
+
+  const commandManagement = useFileResourceManagement(
+    localSettings,
+    persistSettings,
+    setLocalSettings,
+    {
+      settingsKey: 'custom_slash_commands',
+      itemName: 'Command',
+      maxItems: 10,
+      uploadFn: commandService.uploadCommand,
+      deleteFn: commandService.deleteCommand,
+      updateFn: commandService.updateCommand,
+    },
+  );
+  const taskManagement = useTaskManagement(defaultModelId);
+
+  const [revealedFields, setRevealedFields] = useState<Record<ApiFieldKey, boolean>>({
+    e2b_api_key: false,
+    github_personal_access_token: false,
+    claude_code_oauth_token: false,
+    z_ai_api_key: false,
+    openrouter_api_key: false,
+  });
+
+  const hasUnsavedChanges = useMemo(() => {
+    if (!settings) return false;
+    if (activeTab !== 'general' && activeTab !== 'instructions') return false;
+
+    const changedPayload = buildChangedPayload(localSettings, settings);
+    const currentTabFields = TAB_FIELDS[activeTab] ?? [];
+
+    return currentTabFields.some((field) => field in changedPayload);
+  }, [localSettings, settings, activeTab, buildChangedPayload]);
+
+  const handleCancel = () => {
+    if (settings) {
+      setLocalSettings({ ...settings });
+      toast.success('Changes discarded');
+    }
+  };
+
+  const handleSave = () => {
+    const payload = buildChangedPayload(localSettings, settings ?? createFallbackSettings());
+    if (Object.keys(payload).length === 0) {
+      toast.success('No changes to save');
+      return;
+    }
+    manualUpdateMutation.mutate(payload);
+  };
+
+  const handleInputChange = <K extends keyof UserSettings>(field: K, value: UserSettings[K]) => {
+    setLocalSettings((prev) => ({ ...prev, [field]: value }));
+  };
+
+  const handleSecretFieldChange = (field: ApiFieldKey, value: string) => {
+    handleInputChange(field, value);
+  };
+
+  const toggleFieldVisibility = (field: ApiFieldKey) => {
+    setRevealedFields((prev) => ({ ...prev, [field]: !prev[field] }));
+  };
+
+  const handleChatSelect = useCallback(
+    (chatId: string) => {
+      setSelectedChatId(chatId);
+      navigate(`/chat/${chatId}`);
+    },
+    [navigate],
+  );
+
+  const handleDeleteChat = useCallback(
+    (chatId: string) => {
+      deleteChat(chatId, {
+        onSuccess: () => {
+          if (selectedChatId === chatId) {
+            setSelectedChatId(null);
+          }
+        },
+      });
+    },
+    [deleteChat, selectedChatId],
+  );
+
+  const handleDeleteAllChats = () => {
+    setIsDeleteAllDialogOpen(true);
+  };
+
+  const handleNotificationSoundChange = (enabled: boolean) => {
+    persistSettings((prev) => ({ ...prev, notification_sound_enabled: enabled }));
+  };
+
+  const sidebarContent = useMemo(
+    () => (
+      <Sidebar
+        chats={chats}
+        selectedChatId={selectedChatId}
+        onChatSelect={handleChatSelect}
+        onDeleteChat={handleDeleteChat}
+        hasNextPage={hasNextPage}
+        fetchNextPage={fetchNextPage}
+        isFetchingNextPage={isFetchingNextPage}
+      />
+    ),
+    [
+      chats,
+      fetchNextPage,
+      handleChatSelect,
+      handleDeleteChat,
+      hasNextPage,
+      isFetchingNextPage,
+      selectedChatId,
+    ],
+  );
+
+  useLayoutSidebar(sidebarContent);
+
+  const confirmDeleteAllChats = async () => {
+    try {
+      await deleteAllChats.mutateAsync();
+      toast.success('All chats deleted successfully');
+      setSelectedChatId(null);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Failed to delete all chats');
+    } finally {
+      setIsDeleteAllDialogOpen(false);
+    }
+  };
+
+  useEffect(() => {
+    if (settings) {
+      setLocalSettings({ ...settings });
+    }
+  }, [settings]);
+
+  const errorMessage =
+    getErrorMessage(fetchError) ?? getErrorMessage(manualUpdateMutation.error) ?? null;
+
+  if (loading) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-surface dark:bg-surface-dark">
+        <Spinner size="lg" className="text-brand-600" />
+      </div>
+    );
+  }
+
+  if (fetchError && !settings) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-surface dark:bg-surface-dark">
+        <div className="text-text-primary dark:text-text-dark-primary">Failed to load settings</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex min-h-full bg-surface dark:bg-surface-dark">
+      <div className="flex flex-1 justify-center px-4 py-6">
+        <div className="w-full max-w-3xl">
+          <div className="mb-6">
+            <h1 className="flex items-center gap-2 text-xl font-semibold text-text-primary dark:text-text-dark-primary">
+              <SettingsIcon className="h-4 w-4" />
+              Settings
+            </h1>
+          </div>
+
+          <div className="mb-6">
+            <nav
+              className="flex space-x-4 border-b border-border dark:border-border-dark"
+              role="tablist"
+              aria-label="Settings sections"
+            >
+              {tabs.map((tab) => (
+                <Button
+                  key={tab.id}
+                  onClick={() => setActiveTab(tab.id)}
+                  variant="unstyled"
+                  className={tabButtonClasses(activeTab === tab.id)}
+                  role="tab"
+                  aria-selected={activeTab === tab.id}
+                  aria-controls={`${tab.id}-panel`}
+                  id={`${tab.id}-tab`}
+                >
+                  {tab.label}
+                </Button>
+              ))}
+            </nav>
+          </div>
+
+          {hasUnsavedChanges && (
+            <div className="animate-in fade-in slide-in-from-top-2 mb-4 flex items-center justify-between rounded-lg border border-l-4 border-border border-l-brand-500 bg-surface-secondary p-4 shadow-sm duration-300 dark:border-border-dark dark:border-l-brand-600 dark:bg-surface-dark-secondary">
+              <div className="flex items-center gap-3">
+                <AlertCircle className="h-5 w-5 text-brand-600 dark:text-brand-500" />
+                <span className="text-sm font-semibold text-text-primary dark:text-text-dark-primary">
+                  You have unsaved changes
+                </span>
+              </div>
+              <div className="flex items-center gap-3">
+                <Button
+                  type="button"
+                  onClick={handleCancel}
+                  variant="outline"
+                  size="sm"
+                  className="text-text-secondary dark:text-text-dark-secondary"
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="button"
+                  onClick={handleSave}
+                  variant="primary"
+                  size="sm"
+                  isLoading={manualUpdateMutation.isPending}
+                  loadingText="Saving..."
+                >
+                  Save Changes
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {errorMessage && (
+            <div className="mb-4 rounded-md border border-error-200 bg-error-50 p-3 dark:border-error-800 dark:bg-error-900/20">
+              <p className="text-xs text-error-700 dark:text-error-400">{errorMessage}</p>
+            </div>
+          )}
+
+          <ErrorBoundary>
+            <div className="space-y-6">
+              {activeTab === 'general' && (
+                <div role="tabpanel" id="general-panel" aria-labelledby="general-tab">
+                  <GeneralSettingsTab
+                    fields={generalSecretFields}
+                    settings={localSettings}
+                    revealedFields={revealedFields}
+                    onSecretChange={handleSecretFieldChange}
+                    onToggleVisibility={toggleFieldVisibility}
+                    onDeleteAllChats={handleDeleteAllChats}
+                    onNotificationSoundChange={handleNotificationSoundChange}
+                  />
+                </div>
+              )}
+
+              {activeTab === 'mcp' && (
+                <div role="tabpanel" id="mcp-panel" aria-labelledby="mcp-tab">
+                  <McpSettingsTab
+                    mcps={localSettings.custom_mcps ?? null}
+                    onAddMcp={mcpCrud.handleAdd}
+                    onEditMcp={mcpCrud.handleEdit}
+                    onDeleteMcp={mcpCrud.handleDelete}
+                    onToggleMcp={mcpCrud.handleToggleEnabled}
+                  />
+                </div>
+              )}
+
+              {activeTab === 'agents' && (
+                <div role="tabpanel" id="agents-panel" aria-labelledby="agents-tab">
+                  <AgentsSettingsTab
+                    agents={localSettings.custom_agents ?? null}
+                    onAddAgent={agentManagement.handleAdd}
+                    onEditAgent={agentManagement.handleEdit}
+                    onDeleteAgent={agentManagement.handleDelete}
+                    onToggleAgent={agentManagement.handleToggle}
+                  />
+                </div>
+              )}
+
+              {activeTab === 'skills' && (
+                <div role="tabpanel" id="skills-panel" aria-labelledby="skills-tab">
+                  <SkillsSettingsTab
+                    skills={localSettings.custom_skills ?? null}
+                    onAddSkill={skillManagement.handleAdd}
+                    onDeleteSkill={skillManagement.handleDelete}
+                    onToggleSkill={skillManagement.handleToggle}
+                  />
+                </div>
+              )}
+
+              {activeTab === 'commands' && (
+                <div role="tabpanel" id="commands-panel" aria-labelledby="commands-tab">
+                  <CommandsSettingsTab
+                    commands={localSettings.custom_slash_commands ?? null}
+                    onAddCommand={commandManagement.handleAdd}
+                    onEditCommand={commandManagement.handleEdit}
+                    onDeleteCommand={commandManagement.handleDelete}
+                    onToggleCommand={commandManagement.handleToggle}
+                  />
+                </div>
+              )}
+
+              {activeTab === 'env_vars' && (
+                <div role="tabpanel" id="env_vars-panel" aria-labelledby="env_vars-tab">
+                  <EnvVarsSettingsTab
+                    envVars={localSettings.custom_env_vars ?? null}
+                    onAddEnvVar={envVarCrud.handleAdd}
+                    onEditEnvVar={envVarCrud.handleEdit}
+                    onDeleteEnvVar={envVarCrud.handleDelete}
+                  />
+                </div>
+              )}
+
+              {activeTab === 'instructions' && (
+                <div role="tabpanel" id="instructions-panel" aria-labelledby="instructions-tab">
+                  <InstructionsSettingsTab
+                    instructions={localSettings.custom_instructions || ''}
+                    onInstructionsChange={(value) =>
+                      handleInputChange('custom_instructions', value)
+                    }
+                  />
+                </div>
+              )}
+
+              {activeTab === 'tasks' && (
+                <div role="tabpanel" id="tasks-panel" aria-labelledby="tasks-tab">
+                  <TasksSettingsTab
+                    onAddTask={taskManagement.handleAddTask}
+                    onEditTask={taskManagement.handleEditTask}
+                  />
+                </div>
+              )}
+            </div>
+          </ErrorBoundary>
+        </div>
+      </div>
+
+      <ConfirmDialog
+        isOpen={isDeleteAllDialogOpen}
+        onClose={() => setIsDeleteAllDialogOpen(false)}
+        onConfirm={confirmDeleteAllChats}
+        title="Delete All Chats"
+        message="Are you sure you want to delete all chats? This action cannot be undone."
+        confirmLabel="Delete All"
+        cancelLabel="Cancel"
+      />
+
+      <SettingsUploadModal
+        isOpen={agentManagement.isDialogOpen}
+        error={agentManagement.uploadError}
+        uploading={agentManagement.isUploading}
+        onClose={agentManagement.handleDialogClose}
+        onUpload={agentManagement.handleUpload}
+        title="Upload Agent"
+        acceptedExtension=".md"
+        icon={FileText}
+        hintText="The .md file must include YAML frontmatter with name and description fields. Optional fields: model, allowed_tools."
+      />
+
+      <AgentEditDialog
+        isOpen={agentManagement.isEditDialogOpen}
+        agent={agentManagement.editingItem}
+        error={agentManagement.editError}
+        saving={agentManagement.isSavingEdit}
+        onClose={agentManagement.handleEditDialogClose}
+        onSave={agentManagement.handleSaveEdit}
+      />
+
+      <McpDialog
+        isOpen={mcpCrud.isDialogOpen}
+        isEditing={mcpCrud.editingIndex !== null}
+        mcp={mcpCrud.form}
+        error={mcpCrud.formError}
+        onClose={mcpCrud.handleDialogClose}
+        onSubmit={mcpCrud.handleSave}
+        onMcpChange={mcpCrud.handleFormChange}
+      />
+
+      <EnvVarDialog
+        isOpen={envVarCrud.isDialogOpen}
+        isEditing={envVarCrud.editingIndex !== null}
+        envVar={envVarCrud.form}
+        error={envVarCrud.formError}
+        onClose={envVarCrud.handleDialogClose}
+        onSubmit={envVarCrud.handleSave}
+        onEnvVarChange={envVarCrud.handleFormChange}
+      />
+
+      <TaskDialog
+        isOpen={taskManagement.isTaskDialogOpen}
+        isEditing={taskManagement.editingTaskId !== null}
+        task={taskManagement.taskForm}
+        error={taskManagement.taskFormError}
+        onClose={taskManagement.handleTaskDialogClose}
+        onSubmit={taskManagement.handleSaveTask}
+        onTaskChange={taskManagement.handleTaskFormChange}
+      />
+
+      <SettingsUploadModal
+        isOpen={skillManagement.isDialogOpen}
+        error={skillManagement.uploadError}
+        uploading={skillManagement.isUploading}
+        onClose={skillManagement.handleDialogClose}
+        onUpload={skillManagement.handleUpload}
+        title="Upload Skill"
+        acceptedExtension=".zip"
+        icon={FileArchive}
+        hintText="The ZIP must contain a SKILL.md file with YAML frontmatter including name and description fields."
+      />
+
+      <SettingsUploadModal
+        isOpen={commandManagement.isDialogOpen}
+        error={commandManagement.uploadError}
+        uploading={commandManagement.isUploading}
+        onClose={commandManagement.handleDialogClose}
+        onUpload={commandManagement.handleUpload}
+        title="Upload Slash Command"
+        acceptedExtension=".md"
+        icon={FileText}
+        hintText="The .md file must include YAML frontmatter with name and description fields. Optional fields: argument-hint, allowed-tools, model."
+      />
+
+      <CommandEditDialog
+        isOpen={commandManagement.isEditDialogOpen}
+        command={commandManagement.editingItem}
+        error={commandManagement.editError}
+        saving={commandManagement.isSavingEdit}
+        onClose={commandManagement.handleEditDialogClose}
+        onSave={commandManagement.handleSaveEdit}
+      />
+    </div>
+  );
+};
+
+export default SettingsPage;

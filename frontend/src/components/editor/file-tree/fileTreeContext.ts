@@ -1,0 +1,24 @@
+import { createContext, useContext } from 'react';
+import type { FileStructure } from '@/types';
+
+export type FileTreeHandlers = {
+  onFileSelect: (file: FileStructure) => void;
+  onToggleFolder: (path: string) => void;
+};
+
+export interface FileTreeContextValue extends FileTreeHandlers {
+  selectedFile: FileStructure | null;
+  expandedFolders: Record<string, boolean>;
+}
+
+export const FileTreeContext = createContext<FileTreeContextValue | null>(null);
+
+export function useFileTreeContext(component: string) {
+  const context = useContext(FileTreeContext);
+
+  if (!context) {
+    throw new Error(`${component} must be used within a FileTreeProvider`);
+  }
+
+  return context;
+}
