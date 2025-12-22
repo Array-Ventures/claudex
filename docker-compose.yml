@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   postgres:
     image: postgres:13
@@ -10,8 +8,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: ${POSTGRES_DB:-postgres}
-    ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+    # No external port - only accessible within docker network
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -24,8 +21,7 @@ services:
     image: redis:7-alpine
     container_name: claudex-redis
     restart: always
-    ports:
-      - "${REDIS_PORT:-6379}:6379"
+    # No external port - only accessible within docker network
     volumes:
       - redis_data:/data
     healthcheck:
