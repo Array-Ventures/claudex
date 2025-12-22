@@ -103,9 +103,7 @@ services:
       - api
     ports:
       - "${FRONTEND_PORT:-3000}:3000"
-    environment:
-      - VITE_API_URL=${VITE_API_URL:-http://api:8080}
-      - VITE_WS_URL=${VITE_WS_URL}
+    # Note: VITE_API_BASE_URL and VITE_WS_URL are baked in at build time
 
 volumes:
   postgres_data:
