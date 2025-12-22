@@ -1,16 +1,15 @@
 FROM node:20-alpine
 
-# Set working directory
 WORKDIR /app
 
-# Copy package.json and package-lock.json
+# Copy package files and install dependencies
 COPY package*.json ./
-
-# Install dependencies
 RUN npm install --legacy-peer-deps
 
-# Expose the port
+# Copy source code
+COPY . .
+
 EXPOSE 3000
 
-# Command to run dev server with auto-reload
+# Run dev server (for production, consider: npm run build && npm run preview)
 CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "3000"]
