@@ -32,9 +32,7 @@ services:
       retries: 5
 
   api:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: ghcr.io/array-ventures/claudex-api:latest
     container_name: claudex-api
     restart: unless-stopped
     command: ["api"]
@@ -56,9 +54,7 @@ services:
       - ENVIRONMENT=production
 
   celery-worker:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: ghcr.io/array-ventures/claudex-api:latest
     restart: unless-stopped
     command: ["celery-worker"]
     depends_on:
@@ -80,9 +76,7 @@ services:
       replicas: ${CELERY_WORKER_REPLICAS:-4}
 
   celery-beat:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: ghcr.io/array-ventures/claudex-api:latest
     container_name: claudex-celery-beat
     restart: unless-stopped
     command: ["celery-beat"]
@@ -102,9 +96,7 @@ services:
       - ENVIRONMENT=production
 
   frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
+    image: ghcr.io/array-ventures/claudex-frontend:latest
     container_name: claudex-frontend
     restart: unless-stopped
     depends_on:
