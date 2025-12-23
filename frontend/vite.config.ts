@@ -33,7 +33,7 @@ export default defineConfig({
   server: {
     host: true,
     port: 3000,
-    allowedHosts: 'all',
+    allowedHosts: true,
     proxy: {
       '/api': {
         target: 'http://backend:8080',
@@ -46,6 +46,6 @@ export default defineConfig({
   preview: {
     host: true,
     port: 3000,
-    allowedHosts: 'all',
+    allowedHosts: true,
   },
 });
