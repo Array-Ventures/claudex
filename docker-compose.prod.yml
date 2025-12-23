@@ -33,6 +33,7 @@ services:
 
   api:
     image: ghcr.io/array-ventures/claudex-api:latest
+    pull_policy: always
     container_name: claudex-api
     restart: unless-stopped
     command: ["api"]
@@ -56,6 +57,7 @@ services:
 
   celery-worker:
     image: ghcr.io/array-ventures/claudex-api:latest
+    pull_policy: always
     restart: unless-stopped
     command: ["celery-worker"]
     depends_on:
@@ -78,6 +80,7 @@ services:
 
   celery-beat:
     image: ghcr.io/array-ventures/claudex-api:latest
+    pull_policy: always
     container_name: claudex-celery-beat
     restart: unless-stopped
     command: ["celery-beat"]
@@ -98,6 +101,7 @@ services:
 
   frontend:
     image: ghcr.io/array-ventures/claudex-frontend:latest
+    pull_policy: always
     container_name: claudex-frontend
     restart: unless-stopped
     depends_on:
