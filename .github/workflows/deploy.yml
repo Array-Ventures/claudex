@@ -68,4 +68,5 @@ jobs:
             SECRET_KEY=${{ secrets.SECRET_KEY }}
             POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
             VITE_WS_URL=${{ secrets.VITE_WS_URL }}
+            ALLOWED_ORIGINS=${{ secrets.ALLOWED_ORIGINS }}
             LOG_LEVEL=INFO
